@@ -1,0 +1,1119 @@
+================================================================================
+  JIRACHI — MASTER BUILD PLAN (Production-Ready)
+  Multi-Agent Emergency Coordination Platform
+  FAR AWAY 2026 Hackathon · Agentic & Autonomous Systems
+================================================================================
+
+Generated from: CIVICOS_FINAL.md + AI_BUILD.md
+Project root:   C:\Users\ktkrr\Desktop\JIRACHI
+Python:         3.13.7 local (pyproject targets >=3.12,<3.14 — OK)
+Node/pnpm:      via Corepack
+Commands:       python -m uv ...  |  corepack pnpm ...
+
+================================================================================
+  SECTION 0 — KNOWN AMBIGUITIES (RESOLVE BEFORE PHASE 1)
+================================================================================
+
+Three conflicts exist between the plan and the diagram. Do NOT resolve
+silently — ask the user for each one before writing code that touches it.
+
+AMBIGUITY A — Simulate endpoint path conflict
+  Plan table says:   POST /incidents/simulate
+  Phase 6 says:      POST /incidents/simulate/mass-casualty
+  → RECOMMENDATION: Use /incidents/simulate/mass-casualty (more explicit, avoids
+    future collision if single-incident simulate is added). Confirm with user.
+
+AMBIGUITY B — PDF export path conflict
+  Architecture diagram says: /export/pdf
+  API endpoint table says:   GET /incidents/{id}/pdf
+  → RECOMMENDATION: Use GET /incidents/{id}/pdf (per-incident, RESTful, aligns
+    with the sample PDF content which is incident-scoped). Confirm with user.
+
+AMBIGUITY C — KPI ICU fields vs schema mismatch
+  KPI section references ICU-specific fields (icu_used, icu_total).
+  Locked DB schema only has generic: capacity_total, capacity_used.
+  → RECOMMENDATION: Keep the DB schema as locked. Treat capacity_total /
+    capacity_used AS the ICU proxy for hospitals. Add a comment in models.py
+    noting this interpretation. Confirm with user before any schema change.
+
+AMBIGUITY D — Browser visual verification (Phase 0)
+  AI_BUILD.md notes: dev servers were started but browser verification was
+  interrupted. Before Phase 1 begins, manually confirm:
+    - http://127.0.0.1:8000/health  returns  {"status":"ok","app":"JIRACHI"}
+    - http://127.0.0.1:5173         loads React app without console errors
+
+DO NOT proceed to Phase 1 until all four ambiguities are acknowledged by user.
+
+================================================================================
+  SECTION 1 — SECRETS SETUP (Required before Phase 1)
+================================================================================
+
+Copy .env.example to .env and fill in:
+
+  DATABASE_URL       → Neon PostgreSQL connection string
+                       Format: postgresql+asyncpg://user:pass@host/dbname
+                       Get from: neon.tech → project → connection string
+                       ⚠ Add ?sslmode=require for Neon
+
+  SUPABASE_URL       → https://xxxx.supabase.co
+  SUPABASE_ANON_KEY  → long JWT from Supabase dashboard → Settings → API
+
+  GEMINI_API_KEY     → from aistudio.google.com
+
+  VITE_SUPABASE_URL      → same as SUPABASE_URL (frontend copy)
+  VITE_SUPABASE_ANON_KEY → same as SUPABASE_ANON_KEY (frontend copy)
+
+Optional (production hardening):
+  DEMO_MODE          → false (set to true during live demo if Gemini is slow)
+  LANGSMITH_API_KEY  → from smith.langchain.com (free tier, 5K traces/mo)
+  LOG_LEVEL          → INFO
+
+.env must never be committed. Verify it is in .gitignore before proceeding.
+
+================================================================================
+  PHASE 1 — Data Layer + Delhi Seed  [EST: 3-4h]
+  Owner: Backend
+================================================================================
+
+GOAL: 30 Delhi resources in Neon DB, visible via API.
+
+STEP 1.1 — Initialize Alembic
+  cd backend
+  python -m uv run alembic init alembic
+
+  Edit alembic/env.py:
+    - Import Base from app.models
+    - Set target_metadata = Base.metadata
+    - Use async engine from app.db (use run_sync pattern)
+    - Load DATABASE_URL from app.config (not hardcoded)
+
+  Production note: env.py must read the DATABASE_URL from environment,
+  never from a hardcoded string.
+
+STEP 1.2 — Create backend/app/models.py
+  Four SQLAlchemy 2.0 models using Mapped[] typing:
+
+  class Incident(Base):
+    id               : Mapped[uuid.UUID]   PRIMARY KEY, default gen_random_uuid()
+    description      : Mapped[str]         TEXT NOT NULL
+    type             : Mapped[str | None]   VARCHAR(20)
+    severity         : Mapped[str | None]   VARCHAR(20)
+    victims          : Mapped[int]         DEFAULT 0
+    specialty_required: Mapped[str | None] VARCHAR(50)
+    lat              : Mapped[float | None]
+    lng              : Mapped[float | None]
+    status           : Mapped[str]         DEFAULT 'PENDING'
+    priority_score   : Mapped[float | None]
+    created_at       : Mapped[datetime]    TIMESTAMPTZ DEFAULT NOW()
+    resolved_at      : Mapped[datetime | None]
+    time_to_care_min : Mapped[float | None]
+
+  class Resource(Base):
+    id               : Mapped[uuid.UUID]   PRIMARY KEY
+    type             : Mapped[str]         NOT NULL (ambulance|hospital|police)
+    name             : Mapped[str]         NOT NULL
+    lat              : Mapped[float]       NOT NULL
+    lng              : Mapped[float]       NOT NULL
+    capacity_total   : Mapped[int]         DEFAULT 1
+    capacity_used    : Mapped[int]         DEFAULT 0
+    specialty        : Mapped[str | None]  (hospitals only)
+    equipment        : Mapped[list[str] | None]  ARRAY TEXT
+    jurisdiction     : Mapped[str | None]  (police only)
+    status           : Mapped[str]         DEFAULT 'AVAILABLE'
+
+  class Assignment(Base):
+    id               : Mapped[uuid.UUID]   PRIMARY KEY
+    incident_id      : Mapped[uuid.UUID]   FK → incidents.id ON DELETE CASCADE
+    resource_id      : Mapped[uuid.UUID]   FK → resources.id
+    role             : Mapped[str | None]  VARCHAR(50)
+    eta_min          : Mapped[float | None]
+    distance_km      : Mapped[float | None]
+    assigned_at      : Mapped[datetime]    DEFAULT NOW()
+
+  class AuditLog(Base):
+    id               : Mapped[uuid.UUID]   PRIMARY KEY
+    incident_id      : Mapped[uuid.UUID]   FK → incidents.id ON DELETE CASCADE
+    agent_name       : Mapped[str | None]  VARCHAR(50)
+    step             : Mapped[int | None]
+    thought          : Mapped[str | None]  TEXT
+    action           : Mapped[str | None]  TEXT
+    alternatives     : Mapped[dict | None] JSONB
+    logged_at        : Mapped[datetime]    DEFAULT NOW()
+
+  Production note: Add __table_args__ = {"schema": "public"} to each model
+  for explicit Neon schema targeting.
+
+STEP 1.3 — Create Alembic migration
+  python -m uv run alembic revision --autogenerate -m "init_four_tables"
+  → Review the generated file in alembic/versions/ before running
+  → Confirm it creates exactly 4 tables, no extra ones
+  python -m uv run alembic upgrade head
+
+  Production note: Always review auto-generated migrations. Never run
+  upgrade head blindly in production without reading the diff.
+
+STEP 1.4 — Create backend/app/schemas.py
+  Pydantic v2 schemas (separate from ORM models):
+
+  ResourceOut       → id, type, name, lat, lng, capacity_total, capacity_used,
+                      specialty, equipment, jurisdiction, status
+  IncidentCreate    → description, lat, lng  (everything else is computed)
+  IncidentOut       → all incident fields
+  AssignmentOut     → id, incident_id, resource_id, role, eta_min, distance_km
+  AuditLogOut       → all audit_log fields
+  IncidentDetail    → IncidentOut + list[AssignmentOut] + list[AuditLogOut]
+  KPIOut            → avg_time_to_care, resource_utilization, hospital_load_variance
+  SimulateRequest   → scenario: str  (e.g. "mass-casualty")
+  CounterfactualReq → incident_id, override: dict[str, str]
+  CounterfactualOut → original_plan, alternative_plan, time_to_care_delta, reasoning
+
+STEP 1.5 — Create backend/app/seed.py
+  8 hospitals (exact coordinates from plan):
+    AIIMS Delhi          (28.5672, 77.2100)  cap=50  specialty=trauma
+    Safdarjung Hospital  (28.5687, 77.2053)  cap=40  specialty=trauma
+    RML Hospital         (28.6280, 77.2070)  cap=30  specialty=general
+    LNJP Hospital        (28.6406, 77.2381)  cap=35  specialty=general
+    Max Saket            (28.5275, 77.2157)  cap=25  specialty=cardiac
+    Apollo Delhi         (28.5421, 77.2849)  cap=30  specialty=cardiac
+    Fortis Vasant Kunj   (28.5225, 77.1572)  cap=20  specialty=cardiac
+    BLK Hospital         (28.6450, 77.1880)  cap=22  specialty=general
+
+  12 ambulances — random within Delhi bbox [28.55-28.72, 77.10-77.30]
+    Named A1 through A12
+    equipment: random subset of ["defibrillator","oxygen","IV","pediatric_kit"]
+    status: AVAILABLE
+
+  10 police units — random within same bbox
+    Named P1 through P10
+    jurisdiction: assign to zones (Central, South, East, West, North)
+    status: AVAILABLE
+
+  Use a fixed random seed (e.g. seed=42) so coordinates are reproducible
+  across runs. This is important for debugging and demo consistency.
+
+  Script must be idempotent: check if resources already exist before inserting
+  (or truncate first with a --reset flag).
+
+  Run: python -m uv run python -m app.seed
+  Verify: 30 rows in resources table via Neon console or psql.
+
+STEP 1.6 — Add GET /resources endpoint
+  File: backend/app/routers/resources.py
+  Returns all 30 resources as list[ResourceOut]
+  Add optional query param: ?type=ambulance|hospital|police for filtering
+  Include in main.py: app.include_router(resources_router, prefix="/resources")
+
+STEP 1.7 — Add stub GET /kpi endpoint
+  File: backend/app/routers/kpi.py
+  Return: {"avg_time_to_care": 0.0, "resource_utilization": 0.0, "hospital_load_variance": 0.0}
+  Will be replaced in Phase 8.
+
+PHASE 1 DONE CHECK:
+  curl http://127.0.0.1:8000/resources  →  JSON array with 30 objects
+  curl http://127.0.0.1:8000/kpi        →  zeros object
+  Neon console: 4 tables exist, resources has 30 rows
+
+================================================================================
+  PHASE 2 — Map + UI Shell  [EST: 4-6h]
+  Owner: Frontend 1
+================================================================================
+
+GOAL: Delhi map with all 30 markers, three-panel layout.
+
+STEP 2.1 — TanStack Router setup
+  File: frontend/src/router.ts
+  Routes:
+    /          → main dashboard (three-panel layout)
+    /kpi       → KPI dashboard full view
+    /incident/$id → incident detail page
+  Use createRouter + createRootRoute pattern.
+  Production note: All routes must be type-safe (no string-based navigation).
+
+STEP 2.2 — Three-panel layout
+  File: frontend/src/components/Layout.tsx
+  Structure (Tailwind CSS, dark theme):
+    - Full viewport height, no scroll on outer shell
+    - Top: KPITicker (sticky, h-12, border-bottom)
+    - Middle: flex row, h-[calc(100vh-3rem-8rem)]
+      - Left panel: w-72, overflow-y-auto (IncidentList)
+      - Center: flex-1 (Map)
+      - Right panel: w-80, overflow-y-auto (AgentFeed)
+    - Bottom: h-32, border-top (Timeline)
+  Dark theme tokens: bg-gray-950, text-gray-100, border-gray-800
+  Production note: Use CSS variables for theme tokens, not hardcoded colors.
+  This makes dark/light toggling easy later.
+
+STEP 2.3 — Map component
+  File: frontend/src/components/Map.tsx
+  - Leaflet with OSM tiles (no API key needed)
+  - Center: [28.6139, 77.2090], zoom: 11
+  - Custom marker icons per type (use DivIcon with emoji or SVG):
+      ambulance → 🚑 red
+      hospital  → 🏥 blue
+      police    → 🚔 yellow
+  - Popup on click: name, type, status, capacity_used/capacity_total
+  - Markers refresh reactively when resource data changes
+  - Incident markers: 📍 orange, with lines to assigned resources (Polyline)
+  Production note: Import leaflet CSS in main.tsx, not in the component,
+  to avoid duplicate CSS injection.
+
+STEP 2.4 — Data hook
+  File: frontend/src/hooks/useResources.ts
+  - TanStack Query, fetches GET /resources
+  - refetchInterval: 30_000 (30s background refresh)
+  - Return typed data (ResourceOut[])
+
+STEP 2.5 — Stub components (empty shells, no logic yet)
+  frontend/src/components/KPITicker.tsx       → "— Avg Time to Care · — Resources · — Incidents"
+  frontend/src/components/IncidentList.tsx    → empty list with placeholder
+  frontend/src/components/AgentFeed.tsx       → "Agent Feed — waiting..."
+  frontend/src/components/Timeline.tsx        → empty timeline row
+  These will be filled in Phases 3-8.
+
+STEP 2.6 — Zustand store
+  File: frontend/src/store/cityStore.ts
+  Initial state:
+    incidents:     Incident[]
+    activeIncidentId: string | null
+    agentEvents:   AgentEvent[]
+    kpi:           KPIOut | null
+    demoMode:      boolean
+  Actions:
+    setIncidents, addIncident, updateIncident
+    setActiveIncident
+    addAgentEvent, clearAgentEvents
+    setKPI
+    toggleDemoMode
+
+STEP 2.7 — API client
+  File: frontend/src/lib/api.ts
+  Base URL: import.meta.env.VITE_API_URL || "http://127.0.0.1:8000"
+  Type-safe fetch wrappers:
+    getResources()         → ResourceOut[]
+    getIncidents()         → IncidentOut[]
+    getIncident(id)        → IncidentDetail
+    createIncident(data)   → IncidentOut
+    simulate(scenario)     → void
+    getKPI()               → KPIOut
+    getKPIComparison()     → KPIComparisonOut
+    postCounterfactual()   → CounterfactualOut
+    getForecast()          → ForecastOut
+    adminReset()           → void
+  Add VITE_API_URL to .env.example.
+
+STEP 2.8 — Types
+  File: frontend/src/types/index.ts
+  Mirror all Pydantic schemas as TypeScript interfaces.
+  Keep them in sync with backend schemas.py manually.
+
+PHASE 2 DONE CHECK:
+  pnpm dev → no TypeScript errors
+  Browser: map loads, Delhi visible, 30 markers on map
+  Panels: three columns render, no overflow issues
+  Mobile: not required, but layout should not break below 1024px
+
+================================================================================
+  PHASE 3 — Core Incident Flow  [EST: 4-6h]
+  Owner: Backend (1) + Frontend (1) in parallel
+================================================================================
+
+GOAL: Submit incident → assignment appears on map. No agents yet.
+
+BACKEND (3A):
+
+STEP 3A.1 — POST /incidents
+  File: backend/app/routers/incidents.py
+  Input: IncidentCreate (description, lat, lng)
+  Logic (rule-based, no LLM):
+    - Keyword severity detection:
+        "cardiac","heart","chest pain" → HIGH + criticality_bonus=20
+        "fire","burn","explosion"      → CRITICAL + criticality_bonus=15
+        "school","children","pediatric"→ add 10 to criticality_bonus
+        "accident","crash","collision" → MEDIUM, bump to HIGH if victims>5
+        default                        → MEDIUM
+    - Extract victim count from description (regex: "\d+ victim|\d+ people")
+    - Compute priority_score using formula from Section 2.8
+    - Naive nearest-resource assignment (haversine):
+        Find nearest AVAILABLE ambulance
+        Find nearest AVAILABLE hospital matching specialty (or any if no match)
+        Find nearest AVAILABLE police unit
+    - Create incident row, 3 assignment rows, 3 audit_log rows
+    - Return IncidentDetail immediately (synchronous for now)
+
+  Production note: Wrap DB operations in a single transaction. If any insert
+  fails, rollback all. Use async with session.begin().
+
+STEP 3A.2 — GET /incidents and GET /incidents/{id}
+  GET /incidents: return list, ordered by created_at DESC
+    Optional filters: ?status=PENDING&severity=CRITICAL
+  GET /incidents/{id}: return IncidentDetail (incident + assignments + trace)
+
+STEP 3A.3 — POST /incidents/simulate (or /simulate/mass-casualty — confirm ambiguity A first)
+  Accept body: {"scenario": "bus_accident"|"cardiac"|"building_fire"}
+  Return pre-canned incident creation for demo purposes.
+  These will be replaced with the full 3-scenario mass-casualty in Phase 6.
+
+FRONTEND (3B):
+
+STEP 3B.1 — IncidentForm.tsx
+  Text input (textarea, min 2 rows)
+  Three quick-trigger buttons:
+    "🚌 Bus Accident"   → pre-fills description
+    "❤ Cardiac"        → pre-fills description
+    "🔥 Building Fire"  → pre-fills description
+  Lat/lng inputs (hidden, default to India Gate: 28.6127, 77.2295)
+    Allow map click to set coordinates
+  Submit calls POST /incidents, shows loading state
+  On success: add incident to Zustand store + map
+
+STEP 3B.2 — IncidentList.tsx (fill the stub)
+  List of incidents from Zustand store
+  Each row shows: severity badge (colored), description truncated, status, age
+  Click a row → setActiveIncidentId → map highlights that incident
+  Color-coded severity:
+    LOW      → gray badge
+    MEDIUM   → yellow badge
+    HIGH     → orange badge
+    CRITICAL → red badge, pulsing animation
+
+STEP 3B.3 — Map updates (in Map.tsx)
+  On incident creation:
+    - Add red/orange 📍 marker at incident lat/lng
+    - Draw Polylines from incident to each assigned resource
+    - Animate marker with brief bounce effect (Leaflet DivIcon + CSS)
+  On activeIncidentId change:
+    - Zoom and pan to that incident
+    - Highlight its lines
+
+STEP 3B.4 — Polling hook
+  File: frontend/src/hooks/useIncidents.ts
+  TanStack Query, fetches GET /incidents
+  refetchInterval: 2000 (2s for Phase 3; SSE replaces this in Phase 5)
+
+PHASE 3 DONE CHECK:
+  Submit "Bus accident at India Gate, 5 victims" → incident appears in list
+  Map shows incident marker + 3 lines to assigned resources
+  GET /incidents/{id} shows assignments and audit trail
+  DB: incidents=1, assignments=3, audit_logs=3
+
+================================================================================
+  PHASE 4 — LangGraph Agents  [EST: 8-10h] ← CORE PHASE
+  Owner: Backend (full focus, no distractions)
+================================================================================
+
+GOAL: LangGraph graph runs, Gemini parses incidents, coordinator resolves
+      conflicts, full audit trail written.
+
+⚠ WARNING: This is the hardest phase. Do not rush it.
+  Test each agent in isolation before wiring the graph.
+  If Gemini quota is hit during development, use DEMO_MODE temporarily.
+
+STEP 4.1 — LLM wrapper
+  File: backend/app/utils/llm.py
+  Initialize: ChatGoogleGenerativeAI(model="gemini-2.5-flash", ...)
+  Wrap with retry logic (3 attempts, exponential backoff)
+  Check DEMO_MODE env var — if true, return hardcoded response dict
+  Production note: Never log raw Gemini responses (may contain PII from
+  incident descriptions). Log only agent names and step numbers.
+
+STEP 4.2 — CivicState TypedDict
+  File: backend/app/agents/state.py
+  Exactly as defined in Section 2.3 of CIVICOS_FINAL.md.
+  Add: incident_db_id: str  (the UUID from DB, needed to write audit logs)
+  Add: db_session reference for agents that need to persist data
+
+STEP 4.3 — IncidentAgent (LLM)
+  File: backend/app/agents/incident.py
+  Input:  state["raw_description"], state["location"]
+  Prompt: "Parse this emergency incident description and extract structured data.
+           Return JSON with: type, severity, victims, specialty_required,
+           special_notes. Be conservative: if uncertain, use MEDIUM severity."
+  Output: Updates state with type, severity, victims, specialty_required
+  Handles: free-text → "school bus overturned near AIIMS, children may be trapped"
+           output  → {type: accident, severity: CRITICAL, victims: 15,
+                      specialty: trauma, special_notes: "pediatric"}
+  Fallback: if Gemini fails, fall back to Phase 3's keyword-based logic
+  Write audit_log row on completion.
+
+STEP 4.4 — CoordinatorDispatch agent (LLM)
+  File: backend/app/agents/coordinator.py (first pass)
+  Input:  state after IncidentAgent
+  Output: priority_score (computed), signal to fan out to specialists
+  Prompt: "Given this incident severity and type, compute a priority score
+           and determine which specialists are needed."
+  Write audit_log row.
+
+STEP 4.5 — AmbulanceAgent (algorithmic)
+  File: backend/app/agents/ambulance.py
+  Score formula: 0.5*distance_norm + 0.3*equipment_match + 0.2*capacity_free
+    distance_norm = 1 - (distance / max_distance_in_set)
+    equipment_match = fraction of required equipment present
+    capacity_free = (capacity_total - capacity_used) / capacity_total
+  Return top 3 candidates as ambulance_candidates in state
+  Mark each with score, rejection_reason if not top pick
+  Write audit_log row.
+
+STEP 4.6 — HospitalAgent (algorithmic)
+  File: backend/app/agents/hospital.py
+  Score formula: 0.4*specialty_match + 0.3*icu_available + 0.3*distance_norm
+    specialty_match = 1.0 if exact match, 0.5 if general, 0.0 if mismatch
+    icu_available = (capacity_total - capacity_used) / capacity_total
+  Return top 3 candidates as hospital_candidates in state
+  Write audit_log row.
+
+STEP 4.7 — PoliceAgent (algorithmic)
+  File: backend/app/agents/police.py
+  Score formula: 0.5*jurisdiction_match + 0.5*distance_norm
+  Return top 3 candidates as police_candidates in state
+  Write audit_log row.
+
+STEP 4.8 — TrafficAgent (algorithmic)
+  File: backend/app/agents/traffic.py
+  ETA calculation: distance_km / 30 * 60  (30 km/h avg Delhi speed)
+  Corridor logic:
+    if eta > 8 min AND severity in [HIGH, CRITICAL]:
+      corridor_plan = {
+        "route": "suggest fastest path description",
+        "police_escort_needed": True,
+        "recommended_police_unit": top police candidate
+      }
+  Write audit_log row.
+
+STEP 4.9 — ForecastAgent (algorithmic)
+  File: backend/app/agents/forecast.py
+  Input: rolling incident history (last 60 min) from DB
+  Logic:
+    active_count = incidents with status PENDING or ASSIGNED
+    available_ambulances = count resources WHERE type=ambulance AND status=AVAILABLE
+    if active_count >= available_ambulances:
+      forecast_warning = "Resource shortage predicted — pre-position standby units"
+    else:
+      forecast_warning = None
+  Write audit_log row.
+
+STEP 4.10 — CoordinatorFinalize agent (LLM)
+  File: backend/app/agents/coordinator.py (second function)
+  Input: all candidates from all 4 specialist agents
+  Prompt: "Given these resource candidates for a {severity} incident,
+           select the best assignment for each role. Explain each rejection.
+           Consider: criticality bonus, current load, multi-incident contention."
+  Output: final_assignments dict, rejection reasons on each ResourceCandidate
+  Write audit_log row.
+
+STEP 4.11 — Graph wiring
+  File: backend/app/agents/graph.py
+  Exact flow from Section 2.4 of CIVICOS_FINAL.md:
+    START → incident → coord1 → [ambulance, hospital, police, traffic] → coord2 → forecast → END
+  Fan-out from coord1 is parallel (use langgraph Send() API if available,
+  otherwise sequential is acceptable for Phase 4).
+
+STEP 4.12 — Replace Phase 3 rule-based POST /incidents with graph
+  In incidents router, after creating the DB row, call:
+    graph.ainvoke(initial_state)
+  Update assignments + audit_logs from final state.
+  Stream progress via broadcaster (Phase 5 will consume this).
+
+STEP 4.13 — Multi-incident prioritization test (3 AM Mass Casualty Test)
+  Fire 3 incidents simultaneously:
+    t=0s:  Cardiac arrest near India Gate (28.6127, 77.2295), 1 victim
+    t=5s:  Bus crash near AIIMS (28.5672, 77.2100), 15 victims
+    t=12s: Building fire at Connaught Place (28.6315, 77.2167), 8 victims
+  Verify: coordinator assigns ambulances in priority order
+  Verify: if same ambulance is top pick for two incidents, coord2 resolves conflict
+  Verify: audit_logs has full reasoning trail for all 3 incidents
+
+PHASE 4 DONE CHECK:
+  POST /incidents with free-text → full graph runs → assignments in DB
+  GET /incidents/{id} → trace shows all 7 agents
+  3-incident test → prioritization visible in assignments + audit trail
+  No hardcoded Gemini responses (unless DEMO_MODE=true)
+
+================================================================================
+  PHASE 5 — Real-Time SSE + Reasoning Feed  [EST: 4-6h]
+  Owner: Backend (SSE) + Frontend (AgentFeed)
+================================================================================
+
+GOAL: Agent thoughts stream live to browser as graph runs.
+
+BACKEND (5A):
+
+STEP 5A.1 — Broadcaster
+  File: backend/app/utils/broadcaster.py
+  Async pub/sub using asyncio.Queue per incident_id
+  API:
+    publish(incident_id: str, event: dict) → None
+    subscribe(incident_id: str) → AsyncGenerator[dict, None]
+    unsubscribe(incident_id: str) → None
+  Clean up stale queues after 10 minutes of inactivity.
+
+STEP 5A.2 — SSE endpoint
+  File: backend/app/routers/events.py
+  GET /events?incident_id=xxx
+  Uses sse-starlette EventSourceResponse
+  Subscribe to broadcaster queue for that incident_id
+  Yield events as SSE until client disconnects
+  Event format:
+    {
+      "event": "agent_thought",
+      "data": {
+        "incident_id": "uuid",
+        "agent": "AmbulanceAgent",
+        "thought": "Comparing A1 (3.2km) vs A3 (5.8km)...",
+        "action": "Selected A1",
+        "alternatives": ["A3 rejected: longer ETA", "A7 rejected: at capacity"]
+      }
+    }
+  Also emit: "corridor_generated", "plan_finalized", "forecast_alert"
+  Production note: Set Cache-Control: no-cache. SSE connections must not
+  be buffered by proxies. Add X-Accel-Buffering: no header for Render/nginx.
+
+STEP 5A.3 — Publish in each agent
+  In each agent function, after computing result:
+    await broadcaster.publish(state["incident_id"], {...})
+  Do not await the publish if it would block the graph — fire and forget.
+
+FRONTEND (5B):
+
+STEP 5B.1 — useSSE hook
+  File: frontend/src/hooks/useSSE.ts
+  Connect to GET /events?incident_id={activeIncidentId}
+  On message: parse JSON, dispatch to Zustand store (addAgentEvent)
+  Reconnect logic: exponential backoff starting at 1s, max 10s
+  Polling fallback: if SSE fails after 3 retries, fall back to 2s polling
+  Cleanup: close EventSource on component unmount
+
+STEP 5B.2 — AgentFeed.tsx (fill the stub)
+  Right panel, scrolling list of agent events
+  Each event card shows:
+    - Agent name badge (color-coded):
+        IncidentAgent   → purple
+        CoordinatorAgent → blue
+        AmbulanceAgent  → red
+        HospitalAgent   → green
+        PoliceAgent     → yellow
+        TrafficAgent    → orange
+        ForecastAgent   → teal
+    - Thought text
+    - Action taken (bold)
+    - Alternatives (smaller text, grayed, with rejection reasons inline)
+    - Timestamp
+  Auto-scroll to bottom on new event
+  Pause auto-scroll when user hovers over feed
+  Max 200 events shown (virtualize if needed)
+
+STEP 5B.3 — Timeline.tsx (fill the stub)
+  Bottom panel, horizontal scrolling timeline
+  Each agent step as a node on the timeline
+  Show elapsed time from incident creation
+  Click a node → highlight that event in AgentFeed
+
+PHASE 5 DONE CHECK:
+  POST /incidents → watch AgentFeed scroll live in browser
+  Each agent fires its event in order
+  Reconnect: kill/restart backend → frontend reconnects automatically
+  Fallback: disable SSE endpoint → frontend falls back to polling
+
+================================================================================
+  PHASE 6 — Multi-Incident + Failure Handling  [EST: 3-4h]
+  Owner: Backend
+================================================================================
+
+GOAL: 3 incidents fire, system handles resource contention, failure path works.
+
+STEP 6.1 — Canned demo data
+  File: backend/app/utils/demo_data.py
+  MASS_CASUALTY_SCENARIO = [
+    {incident data for cardiac at India Gate, delay=0},
+    {incident data for bus crash at AIIMS, delay=5},
+    {incident data for fire at Connaught Place, delay=12}
+  ]
+  Each entry: description, lat, lng, delay_seconds
+
+STEP 6.2 — POST /incidents/simulate/mass-casualty endpoint
+  (Confirm path with user — see Ambiguity A)
+  Trigger all 3 incidents with asyncio.sleep() delays
+  Return immediately with a task ID or just 202 Accepted
+  Each incident triggers its own graph run independently
+  Broadcasts all events via SSE (client subscribes per incident or to all)
+
+STEP 6.3 — Multi-incident coordinator logic
+  In CoordinatorFinalize (coord2), before assigning a resource:
+    Check if resource.status == AVAILABLE in DB (may have changed)
+    If resource was just assigned to another incident:
+      Log: "Resource X already assigned to incident Y (higher priority)"
+      Fall back to next-best candidate from specialist list
+  Production note: Use SELECT FOR UPDATE on resource rows during assignment
+  to prevent double-booking under concurrent graph runs.
+
+STEP 6.4 — Failure handling
+  If no AVAILABLE resource exists for a required role:
+    Set incident.status = FAILED
+    Add audit_log entry: agent=CoordinatorAgent, action="CRITICAL_SHORTAGE"
+    Broadcast event: {"event": "resource_shortage", "data": {...}}
+
+STEP 6.5 — FailureAlert.tsx (new component)
+  Red banner overlay on the incident card in IncidentList
+  Shows: "⚠ Critical Resource Shortage — no ambulance available"
+  Also shows as a toast notification at top of screen
+
+STEP 6.6 — Frontend multi-incident support
+  Map shows all 3 incidents simultaneously with distinct colors:
+    Incident 1 → red markers/lines
+    Incident 2 → orange markers/lines
+    Incident 3 → yellow markers/lines
+  Timeline at bottom shows all 3 in parallel rows
+  IncidentList shows all 3 with their individual statuses
+
+PHASE 6 DONE CHECK:
+  Click "3 AM Test" → 3 incidents fire with delays
+  Map shows 3 incident markers + assignment lines
+  If only 2 ambulances available, 3rd incident shows FAILED + FailureAlert
+  Audit trail shows rejection reasons for contention
+
+================================================================================
+  PHASE 7 — Counterfactual Simulator  [EST: 3-4h] ⭐ DIFFERENTIATOR
+  Owner: Backend (logic) + Frontend (modal)
+================================================================================
+
+GOAL: Click "Why not A7?" → side-by-side modal showing time-to-care delta.
+
+STEP 7.1 — POST /counterfactual
+  Body: {incident_id: str, override: {role: str, resource_id: str}}
+  Logic:
+    1. Load original incident state from DB
+    2. Force override: set override.resource_id as the assignment for override.role
+    3. Re-run coordinator graph (skip IncidentAgent, use stored parsed data)
+    4. Recompute ETAs with haversine + 30 km/h formula
+    5. Return:
+       {
+         original_plan: {assignments, time_to_care_min},
+         alternative_plan: {assignments, time_to_care_min},
+         time_to_care_delta: float,  # positive = original better
+         reasoning: str              # from CoordinatorFinalize
+       }
+  Production note: Counterfactual runs do NOT write to DB.
+  This is a read-only simulation. Never persist counterfactual assignments.
+
+STEP 7.2 — Rejection reason links in AgentFeed
+  For each rejected candidate in AgentFeed, render a clickable link:
+    "A7 rejected: at capacity  [Why not A7?]"
+  Clicking the link opens the CounterfactualModal with that resource pre-filled.
+
+STEP 7.3 — CounterfactualModal.tsx
+  Triggered by "Why not X?" click
+  Shows loading state while POST /counterfactual runs
+  Side-by-side layout:
+    LEFT:  Original Plan (what CivicOS chose)
+    RIGHT: Alternative Plan (what would have happened with override)
+  Big delta number: "Using A7 would have increased response time by +3.2 min"
+    or: "Using A7 would have reduced response time by -1.1 min" (if user finds a better option)
+  Reasoning chain for both plans (collapsible)
+  Close button or click outside
+
+PHASE 7 DONE CHECK:
+  Click any rejection reason → modal opens
+  Modal shows two plans side by side
+  Delta number is clearly visible and correct
+  Counterfactual does not persist to DB
+
+================================================================================
+  PHASE 8 — KPIs + Hospital Load + Comparison Mode  [EST: 4-6h]
+  Owner: Frontend 2 + Backend (calc)
+================================================================================
+
+GOAL: Live KPI dashboard, hospital load chart, CivicOS vs Naive toggle.
+
+BACKEND (8A):
+
+STEP 8A.1 — GET /kpi (real implementation, replace stub)
+  Queries:
+    avg_time_to_care = AVG(time_to_care_min) WHERE status=RESOLVED
+    resource_utilization = COUNT(*) WHERE status=BUSY / COUNT(*) total
+    hospital_load_variance = STDDEV(capacity_used / capacity_total) for hospitals
+  Returns KPIOut
+
+STEP 8A.2 — GET /kpi/comparison
+  Naive baseline simulation:
+    Re-run past incidents with random assignment (no scoring, just random available)
+    Average time_to_care for random vs CivicOS
+  Return:
+    {
+      civicos: {avg_time_to_care, resource_utilization},
+      naive:   {avg_time_to_care, resource_utilization},
+      improvement_pct: float
+    }
+  Note: For demo, it is acceptable to return hardcoded naive values (13.4 min)
+  if no incidents have been resolved yet. Flag this clearly in the code.
+
+STEP 8A.3 — GET /forecast (real implementation)
+  Run ForecastAgent logic on demand
+  Return: {shortage_predicted: bool, shortage_in_min: int|None, recommendations: list[str]}
+
+FRONTEND (8B):
+
+STEP 8B.1 — KPITicker.tsx (fill the stub)
+  Sticky top bar, 3 numbers:
+    Avg Time to Care: X.X min
+    Resources Active: X / 30
+    Incidents Today:  X
+  Auto-refreshes every 10s via TanStack Query
+
+STEP 8B.2 — KPIDashboard.tsx
+  Full page view (/kpi route)
+  Three big number cards at top
+  HospitalLoadChart below (see 8B.3)
+  ComparisonToggle (see 8B.4)
+
+STEP 8B.3 — HospitalLoadChart.tsx
+  Recharts BarChart, 8 hospitals on X axis
+  Y axis: utilization percentage (capacity_used / capacity_total * 100)
+  Two bars per hospital: CivicOS vs Naive (toggle with ComparisonToggle)
+  Color: CivicOS bars = blue, Naive bars = red
+  Tooltip: exact counts on hover
+
+STEP 8B.4 — ComparisonToggle.tsx
+  Toggle switch: "CivicOS" ↔ "Without CivicOS"
+  When toggled to Without: all KPIs switch to naive baseline values
+  Big improvement label: "CivicOS is 39% faster" (or computed value)
+
+STEP 8B.5 — ForecastBanner.tsx
+  Top banner (below KPITicker, dismissible)
+  Shows when GET /forecast returns shortage_predicted=true
+  Text: "⚠ Resource shortage predicted in X min — pre-positioning recommended"
+  Orange background, pulse animation
+  Dismissible with X button (but re-appears if still predicted on next poll)
+
+PHASE 8 DONE CHECK:
+  KPITicker shows live numbers
+  KPI dashboard opens at /kpi
+  Hospital load chart renders with 8 bars
+  Toggle switches between CivicOS and Naive values
+  Forecast banner appears when shortage is predicted
+
+================================================================================
+  PHASE 9 — PDF Export + DEMO_MODE + Reset  [EST: 3-4h]
+  Owner: Backend (PDF) + Frontend (buttons)
+================================================================================
+
+GOAL: PDF downloads, DEMO_MODE works, city resets cleanly.
+
+BACKEND (9A):
+
+STEP 9A.1 — GET /incidents/{id}/pdf
+  (Confirm path with user — see Ambiguity B)
+  File: backend/app/routers/pdf.py (or incidents.py)
+  Uses reportlab to generate PDF:
+
+  Content:
+    JIRACHI — EMERGENCY RESPONSE REPORT
+    ════════════════════════════════════
+    Incident: [description]
+    Type: [type]      Severity: [severity]
+    Victims: [victims]
+    Created: [created_at IST]
+    Resolved: [resolved_at IST] (or PENDING)
+    Time to Care: [time_to_care_min] min
+
+    ASSIGNMENTS
+    • Ambulance [name] — ETA [eta] min — [hospital name]
+    • Hospital: [name] — specialty match: [yes/no]
+    • Police: [name] — corridor support
+
+    REASONING CHAIN
+    [numbered list from audit_logs, one per agent]
+
+    AUDIT TRAIL
+    [timestamp, agent, action — full log]
+
+  Return as: Response(content=pdf_bytes, media_type="application/pdf",
+             headers={"Content-Disposition": "attachment; filename=jirachi_{id}.pdf"})
+
+STEP 9A.2 — DEMO_MODE env var
+  In app/config.py: DEMO_MODE: bool = False
+  In app/utils/llm.py: if settings.DEMO_MODE → return canned responses
+  Canned responses must be realistic (not "fake response"):
+    IncidentAgent canned: {type: accident, severity: CRITICAL, victims: 15, specialty: trauma}
+    CoordinatorAgent canned: selects A1, AIIMS, P3 — standard choices
+  DEMO_MODE guarantees <1s response for any incident.
+
+STEP 9A.3 — POST /admin/reset
+  Requires a simple admin token header (X-Admin-Token from .env)
+  Do NOT use this endpoint without auth.
+  Truncates: incidents, assignments, audit_logs
+  Resets resources: set all capacity_used=0, status=AVAILABLE
+  Returns: {reset: true, timestamp: "..."}
+  Production note: This is a destructive operation. Log it. Add a confirmation
+  step in the frontend.
+
+FRONTEND (9B):
+
+STEP 9B.1 — PDFButton.tsx
+  Small button on each incident in IncidentList
+  Icon: download/PDF icon (Lucide)
+  On click: fetch /incidents/{id}/pdf, trigger browser download
+  Show loading spinner while generating
+
+STEP 9B.2 — ResetCityButton.tsx
+  In left panel, below incident list
+  Red button: "Reset City"
+  Opens shadcn Dialog: "This will clear all incidents and reset all resources. Continue?"
+  On confirm: POST /admin/reset → clear Zustand store → refetch all data
+
+STEP 9B.3 — DemoModeToggle.tsx
+  Dev/debug only — do not show in production UI
+  Conditionally rendered: only if import.meta.env.DEV === true
+  Toggle: switches DEMO_MODE on backend (requires admin endpoint)
+  Or: toggle a frontend flag that adds ?demo=true to API calls
+
+PHASE 9 DONE CHECK:
+  PDF downloads for any resolved incident with correct content
+  DEMO_MODE=true makes graph respond in <1s
+  POST /admin/reset clears all data and map returns to 30 static markers
+
+================================================================================
+  PHASE 10 — Video + Submission  [EST: 4-6h]
+  Owner: Whoever is best on camera / video editing
+================================================================================
+
+GOAL: Repo public, video uploaded, submission form filled.
+
+STEP 10.1 — Final pre-submission checklist
+  [ ] Run: python -m uv run alembic upgrade head  (clean DB)
+  [ ] Run: python -m uv run python -m app.seed     (30 resources)
+  [ ] Run: corepack pnpm exec tsc --noEmit          (no TS errors)
+  [ ] Run: corepack pnpm exec vite build            (production build)
+  [ ] Verify Render deploy: https://[app].onrender.com/health → 200
+  [ ] Verify Vercel deploy: https://[app].vercel.app → React loads
+  [ ] Set DEMO_MODE=false on Render for recording
+  [ ] Check all env vars set on Render + Vercel
+
+STEP 10.2 — Demo script (3 AM Mass Casualty Test)
+  1. Open app in browser, show Delhi map with 30 markers
+  2. Click "3 AM Test" → 3 incidents fire
+  3. Watch AgentFeed scroll with live agent reasoning
+  4. Map shows 3 incident markers + assignment lines
+  5. Show prioritization: cardiac gets ambulance first
+  6. Click "Why not A7?" → Counterfactual modal opens → show delta
+  7. Navigate to /kpi → show dashboard → toggle to Naive → show improvement
+  8. Show Forecast banner
+  9. Click PDF download on resolved incident
+  10. Click Reset City → confirm → map returns to clean state
+
+STEP 10.3 — Video storyboard (2 min max)
+  0-15s:   Hook: "In India, 8,000 die in road accidents daily. Response time
+           decides if they live. This is JIRACHI."
+  15-30s:  Architecture diagram (Mermaid, animated if possible)
+  30-75s:  The 3 AM Mass Casualty Test (live demo, no cuts)
+  75-95s:  Counterfactual — "Why not A7?" → side-by-side modal
+  95-110s: KPI dashboard — "13.4 min → 8.1 min. 39% faster."
+  110-120s: Forecast banner. Close with repo/URL card.
+
+STEP 10.4 — README.md (final polish)
+  Sections:
+    [Hero image — Mermaid architecture diagram]
+    ## Problem
+    [One paragraph — road accident deaths, response time gap]
+    ## Solution
+    [One paragraph — JIRACHI's 7-agent approach, key metrics]
+    ## Setup (runs in 3 commands)
+      git clone ... && cd JIRACHI
+      cp .env.example .env  # fill in your keys
+      cd backend && python -m uv sync && python -m uv run uvicorn app.main:app --reload
+      cd frontend && corepack pnpm install && corepack pnpm dev
+    ## Demo
+    [YouTube link]
+    ## Tech Stack
+    [table from CIVICOS_FINAL.md Section 1]
+    ## Team
+    ## License: MIT
+
+STEP 10.5 — Submission
+  [ ] GitHub repo: set to Public
+  [ ] Create MIT LICENSE file
+  [ ] Tag release: git tag v1.0.0 && git push --tags
+  [ ] Upload video to YouTube (Unlisted)
+  [ ] 15-slide backup deck (PDF)
+  [ ] Fill submission form
+
+PHASE 10 DONE CHECK:
+  repo is public
+  README has demo video link
+  clone → 3 commands → app runs
+  Submission form submitted
+
+================================================================================
+  SECTION 2 — PRODUCTION HARDENING (cross-cutting, apply throughout)
+================================================================================
+
+These must be addressed at each phase, not saved for the end.
+
+H1 — Environment variable validation at startup
+  In app/config.py, Settings class with pydantic-settings:
+    @validator('DATABASE_URL') → verify it starts with postgresql+asyncpg://
+    @validator('GEMINI_API_KEY') → verify non-empty
+  If any required var is missing, fail fast with a clear error message.
+  Never let the app start with empty secrets.
+
+H2 — Database connection pooling
+  In app/db.py, set pool_size=5, max_overflow=10, pool_timeout=30
+  For Neon serverless, use NullPool to avoid connection pinning:
+    from sqlalchemy.pool import NullPool
+    engine = create_async_engine(DATABASE_URL, poolclass=NullPool)
+  This is critical for Neon — do not use the default pool with serverless.
+
+H3 — CORS configuration (production)
+  In app/main.py, CORSMiddleware:
+    Development: allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"]
+    Production:  allow_origins=[settings.FRONTEND_URL]  (from .env)
+    Never use allow_origins=["*"] in production.
+
+H4 — Proper HTTP status codes
+  201 Created → POST /incidents (not 200)
+  404 Not Found → GET /incidents/{id} when id doesn't exist
+  422 Unprocessable → invalid input (Pydantic handles this automatically)
+  500 Internal Server Error → unhandled exceptions (with error logging)
+  Add global exception handler in main.py for 500s.
+
+H5 — Input validation and sanitization
+  Incident description: max 2000 characters
+  Coordinates: lat in [-90, 90], lng in [-180, 180]
+  Validate in Pydantic schemas with Field(max_length=2000) and validators.
+  Never pass raw user input directly to Gemini prompts without escaping.
+
+H6 — Structured logging
+  Use Python's logging module (not print statements)
+  Log format: ISO timestamp, level, module, message
+  In production (Render), logs go to stdout → captured by Render dashboard
+  Log: request method+path+status+duration for all requests
+  Do NOT log: raw Gemini responses, database passwords, JWT tokens
+
+H7 — Graceful shutdown
+  In app/main.py, use @asynccontextmanager lifespan:
+    On startup: verify DB connection, log "JIRACHI started"
+    On shutdown: close DB pool, drain broadcaster queues, log "JIRACHI stopping"
+
+H8 — Rate limiting (basic, for demo safety)
+  Add slowapi (pip install slowapi) to backend
+  Rate limit POST /incidents: 10/minute per IP
+  Rate limit POST /admin/reset: 1/minute (nuclear button)
+  This prevents accidental DoS during demo.
+
+H9 — SSE reconnection (frontend)
+  EventSource reconnects automatically by spec.
+  But set: eventSource.onerror → exponential backoff (1s, 2s, 4s, max 10s)
+  After 5 failed reconnects, fall back to 2s polling.
+  Show a subtle "Reconnecting..." indicator in AgentFeed.
+
+H10 — Render cold start mitigation
+  Render free tier sleeps after 15 min of inactivity.
+  Solution A (preferred): Use UptimeRobot (free) to ping /health every 10 min.
+  Solution B: Run demo from local backend during actual demo recording.
+  Solution C: Set DEMO_MODE=true on Render to make cold-start responses instant.
+  For hackathon demo: always have local backend running as backup.
+
+H11 — Neon connection limits
+  Neon free tier: max 3 concurrent connections.
+  Use NullPool (see H2). Open connection, run query, close immediately.
+  If you hit "too many connections": check for unclosed sessions in tests.
+
+H12 — Audit log size cap
+  Cap at 200 entries per incident (per the plan's risk checklist).
+  In AuditLog writes: if count > 200, skip with a warning log.
+  Add a cleanup job concept (not needed for hackathon, note for production).
+
+================================================================================
+  SECTION 3 — QUICK REFERENCE
+================================================================================
+
+COMMANDS:
+
+  Backend:
+    Start dev:          cd backend && python -m uv run uvicorn app.main:app --reload
+    Run migrations:     python -m uv run alembic upgrade head
+    Seed database:      python -m uv run python -m app.seed
+    Run tests:          python -m uv run pytest tests/
+    Add dependency:     python -m uv add <package>
+
+  Frontend:
+    Start dev:          cd frontend && corepack pnpm dev
+    Type check:         corepack pnpm exec tsc --noEmit
+    Production build:   corepack pnpm exec vite build
+    Add dependency:     corepack pnpm add <package>
+
+URLS (local):
+  Backend:    http://127.0.0.1:8000
+  Swagger UI: http://127.0.0.1:8000/docs
+  Frontend:   http://127.0.0.1:5173
+
+URLS (production):
+  Backend:    https://[your-app].onrender.com
+  Frontend:   https://[your-app].vercel.app
+
+ENVIRONMENT VARIABLES (.env):
+  DATABASE_URL            postgresql+asyncpg://user:pass@host/db?sslmode=require
+  SUPABASE_URL            https://xxxx.supabase.co
+  SUPABASE_ANON_KEY       eyJ...
+  GEMINI_API_KEY          AIza...
+  VITE_API_URL            http://127.0.0.1:8000  (or Render URL in prod)
+  VITE_SUPABASE_URL       https://xxxx.supabase.co
+  VITE_SUPABASE_ANON_KEY  eyJ...
+  DEMO_MODE               false
+  ADMIN_TOKEN             [random string, you choose]
+  FRONTEND_URL            http://localhost:5173  (or Vercel URL in prod)
+
+DEMO SEED DATA (3 AM Test):
+  Incident 1: Cardiac arrest near India Gate    (28.6127, 77.2295)  delay=0s
+  Incident 2: Bus crash near AIIMS              (28.5672, 77.2100)  delay=5s
+  Incident 3: Building fire at Connaught Place  (28.6315, 77.2167)  delay=12s
+
+PRIORITY FORMULA:
+  SCORE = (SEVERITY_WEIGHT * severity_val) + (2 * victims) + (0.5 * minutes_waiting) + criticality_bonus
+  severity_val:      LOW=1, MEDIUM=3, HIGH=7, CRITICAL=10
+  criticality_bonus: cardiac=20, stroke=18, burns=15, trauma=10, general=0
+
+================================================================================
+  SECTION 4 — PHASE TIMELINE SUMMARY
+================================================================================
+
+  SERIAL (must complete in order):
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ Phase 0 DONE → Phase 1 (3-4h) → Phase 2 (4-6h) → Phase 3 (4-6h)   │
+  │                              → Phase 4 (8-10h) → Phase 5 (4-6h)    │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  PARALLEL (after Phase 5):
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ Frontend 1:      │ Frontend 2:     │ Backend:       │ Anyone:        │
+  │ Phase 6 UI       │ Phase 7 modal   │ Phase 6 logic  │ Phase 9 PDF    │
+  │ Phase 8 charts   │ Phase 8 KPIs    │ Phase 7 logic  │ Phase 10 video │
+  │ Phase 9 toggle   │ Phase 9 reset   │ Phase 8 calc   │                │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  TIME ESTIMATES:
+  Phase 1:  3-4h   Data Layer
+  Phase 2:  4-6h   UI Shell
+  Phase 3:  4-6h   Core Flow
+  Phase 4:  8-10h  Agents (CRITICAL PATH)
+  Phase 5:  4-6h   SSE
+  Phase 6:  3-4h   Multi-incident
+  Phase 7:  3-4h   Counterfactual
+  Phase 8:  4-6h   KPIs
+  Phase 9:  3-4h   PDF + Demo tools
+  Phase 10: 4-6h   Video + Submit
+  ─────────────────────
+  TOTAL:    40-56h (focused, no major bugs)
+
+================================================================================
+  SECTION 5 — KILL CRITERIA (from original plan)
+================================================================================
+
+1. Phase 4 not working by mid-hackathon → STOP and fix. Do not stack features.
+2. Multi-incident (Phase 6) fails → drop from demo. Lead with single + counterfactual.
+3. SSE broken → fall back to 2s polling. Less impressive but works.
+4. Gemini slow → set DEMO_MODE=true. Never demo with live LLM unless it's fast.
+5. Video too long → cut hook and closing. NEVER cut the live demo section.
+
+================================================================================
+  END OF JIRACHI MASTER BUILD PLAN
+  Last updated: based on AI_BUILD.md handoff + CIVICOS_FINAL.md
+================================================================================

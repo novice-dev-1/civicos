@@ -1,0 +1,29 @@
+[project]
+name = "jirachi-backend"
+version = "0.1.0"
+description = "JIRACHI emergency coordination backend"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "alembic>=1.18.4",
+    "asyncpg>=0.31.0",
+    "fastapi>=0.136.3",
+    "google-genai>=2.8.0",
+    "haversine>=2.9.0",
+    "langchain-google-genai>=4.2.5",
+    "langgraph>=1.2.4",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.14.1",
+    "python-jose>=3.5.0",
+    "reportlab>=4.5.1",
+    "sqlalchemy[asyncio]>=2.0.50",
+    "sse-starlette>=3.4.4",
+    "supabase>=2.31.0",
+    "uvicorn[standard]>=0.49.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+]

@@ -1,0 +1,80 @@
+@import "tailwindcss";
+
+:root {
+  --color-bg: #030712;
+  --color-panel: #080f1f;
+  --color-border: #1f2937;
+  --color-text: #f3f4f6;
+  --color-muted: #9ca3af;
+  --color-accent: #22d3ee;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+}
+
+.leaflet-container {
+  background: #020617;
+  color: #111827;
+}
+
+.resource-marker {
+  display: grid;
+  place-items: center;
+  border: 2px solid #f8fafc;
+  border-radius: 999px;
+  box-shadow: 0 8px 18px rgb(0 0 0 / 0.35);
+  color: #020617;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.resource-marker span {
+  display: grid;
+  height: 30px;
+  place-items: center;
+  width: 30px;
+}
+
+.resource-marker-ambulance {
+  background: #ef4444;
+}
+
+.resource-marker-hospital {
+  background: #38bdf8;
+}
+
+.resource-marker-police {
+  background: #facc15;
+}
+
+.incident-marker {
+  display: grid;
+  place-items: center;
+  border: 2px solid #fff7ed;
+  border-radius: 999px;
+  background: #fb923c;
+  box-shadow: 0 0 0 6px rgb(251 146 60 / 0.18), 0 12px 24px rgb(0 0 0 / 0.35);
+  color: #111827;
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.incident-marker span {
+  display: grid;
+  height: 30px;
+  place-items: center;
+  width: 30px;
+}
+
+.incident-marker-active {
+  background: #22d3ee;
+  box-shadow: 0 0 0 8px rgb(34 211 238 / 0.22), 0 14px 30px rgb(0 0 0 / 0.42);
+}
